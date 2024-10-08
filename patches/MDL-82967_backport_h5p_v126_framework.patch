@@ -1,0 +1,693 @@
+diff --git a/contentbank/contenttype/h5p/tests/behat/teacher_upload_content.feature b/contentbank/contenttype/h5p/tests/behat/teacher_upload_content.feature
+index 60c71f7a9ea..48124377548 100644
+--- a/contentbank/contenttype/h5p/tests/behat/teacher_upload_content.feature
++++ b/contentbank/contenttype/h5p/tests/behat/teacher_upload_content.feature
+@@ -152,7 +152,7 @@ Feature: H5P file upload to content bank for non admins
+     And I switch to "h5p-player" class iframe
+     And I switch to "h5p-iframe" class iframe
+     Then I should see "Of which countries"
+-    Then I should not see "missing-required-library"
++    Then I should not see "missing-main-library"
+     And I switch to the main frame
+     Given I log out
+     And I log in as "admin"
+@@ -174,4 +174,4 @@ Feature: H5P file upload to content bank for non admins
+     And I should see "filltheblanks.h5p"
+     And I click on "filltheblanks.h5p" "link"
+     And I switch to "h5p-player" class iframe
+-    And I should see "missing-required-library"
++    And I should see "missing-main-library"
+diff --git a/h5p/classes/api.php b/h5p/classes/api.php
+index d2e9974dad2..46272dcd8eb 100644
+--- a/h5p/classes/api.php
++++ b/h5p/classes/api.php
+@@ -67,6 +67,17 @@ class api {
+         $DB->delete_records('h5p_library_dependencies', array('libraryid' => $library->id));
+         $DB->delete_records('h5p_libraries', array('id' => $library->id));
+ 
++        // Remove the library from the cache.
++        $libscache = \cache::make('core', 'h5p_libraries');
++        $libarray = [
++            'machineName' => $library->machinename,
++            'majorVersion' => $library->majorversion,
++            'minorVersion' => $library->minorversion,
++        ];
++        $libstring = H5PCore::libraryToString($libarray);
++        $librarykey = helper::get_cache_librarykey($libstring);
++        $libscache->delete($librarykey);
++
+         // Remove the libraries using this library.
+         $requiredlibraries = self::get_dependent_libraries($library->id);
+         foreach ($requiredlibraries as $requiredlibrary) {
+diff --git a/h5p/classes/core.php b/h5p/classes/core.php
+index 1a60d55a1e9..8c6935dd598 100644
+--- a/h5p/classes/core.php
++++ b/h5p/classes/core.php
+@@ -14,14 +14,6 @@
+ // You should have received a copy of the GNU General Public License
+ // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
+ 
+-/**
+- * H5P core class.
+- *
+- * @package    core_h5p
+- * @copyright  2019 Sara Arjona <sara@moodle.com>
+- * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+- */
+-
+ namespace core_h5p;
+ 
+ defined('MOODLE_INTERNAL') || die();
+@@ -35,6 +27,9 @@ use stdClass;
+ use moodle_url;
+ use core_h5p\local\library\autoloader;
+ 
++// phpcs:disable moodle.NamingConventions.ValidFunctionName.LowercaseMethod
++// phpcs:disable moodle.NamingConventions.ValidVariableName.VariableNameLowerCase
++
+ /**
+  * H5P core class, containing functions and storage shared by the other H5P classes.
+  *
+@@ -74,7 +69,7 @@ class core extends H5PCore {
+     protected function getDependencyPath(array $dependency): string {
+         $library = $this->find_library($dependency);
+ 
+-        return "libraries/{$library->id}/{$library->machinename}-{$library->majorversion}.{$library->minorversion}";
++        return "libraries/{$library->id}/" . H5PCore::libraryToFolderName($dependency);
+     }
+ 
+     /**
+@@ -89,12 +84,12 @@ class core extends H5PCore {
+         $context = \context_system::instance();
+         foreach ($dependencies as $dependency) {
+             $library = $this->find_library($dependency);
+-            $roots[self::libraryToString($dependency, true)] = (moodle_url::make_pluginfile_url(
++            $roots[self::libraryToFolderName($dependency)] = (moodle_url::make_pluginfile_url(
+                 $context->id,
+                 'core_h5p',
+                 'libraries',
+                 $library->id,
+-                "/" . self::libraryToString($dependency, true),
++                "/" . self::libraryToFolderName($dependency),
+                 ''
+             ))->out(false);
+         }
+@@ -412,10 +407,45 @@ class core extends H5PCore {
+      * @return string The string name on the form {machineName} {majorVersion}.{minorVersion}.
+      */
+     public static function record_to_string(stdClass $record, bool $foldername = false): string {
+-        return static::libraryToString([
+-            'machineName' => $record->machinename,
+-            'majorVersion' => $record->majorversion,
+-            'minorVersion' => $record->minorversion,
+-        ], $foldername);
++        if ($foldername) {
++            return static::libraryToFolderName([
++                'machineName' => $record->machinename,
++                'majorVersion' => $record->majorversion,
++                'minorVersion' => $record->minorversion,
++            ]);
++        } else {
++            return static::libraryToString([
++                'machineName' => $record->machinename,
++                'majorVersion' => $record->majorversion,
++                'minorVersion' => $record->minorversion,
++            ]);
++        }
++
+     }
++
++    /**
++     * Small helper for getting the library's ID.
++     * This method is rewritten to use MUC (instead of an static variable which causes some problems with PHPUnit).
++     *
++     * @param array $library
++     * @param string $libString
++     * @return int Identifier, or FALSE if non-existent
++     */
++    public function getLibraryId($library, $libString = null) {
++        if (!$libString) {
++            $libString = self::libraryToString($library);
++        }
++
++        // Check if this information has been saved previously into the cache.
++        $libcache = \cache::make('core', 'h5p_libraries');
++        $librarykey = helper::get_cache_librarykey($libString);
++        $libraryId = $libcache->get($librarykey);
++        if ($libraryId === false) {
++            $libraryId = $this->h5pF->getLibraryId($library['machineName'], $library['majorVersion'], $library['minorVersion']);
++            $libcache->set($librarykey, $libraryId);
++        }
++
++        return $libraryId;
++    }
++
+ }
+diff --git a/h5p/classes/file_storage.php b/h5p/classes/file_storage.php
+index ab7497a12b1..9ae0606c47d 100644
+--- a/h5p/classes/file_storage.php
++++ b/h5p/classes/file_storage.php
+@@ -29,6 +29,8 @@ use Moodle\H5PCore;
+ use Moodle\H5peditorFile;
+ use Moodle\H5PFileStorage;
+ 
++// phpcs:disable moodle.NamingConventions.ValidFunctionName.LowercaseMethod
++
+ /**
+  * Class to handle storage and export of H5P Content.
+  *
+@@ -86,8 +88,8 @@ class file_storage implements H5PFileStorage {
+             'contextid' => $this->context->id,
+             'component' => self::COMPONENT,
+             'filearea' => self::LIBRARY_FILEAREA,
+-            'filepath' => '/' . H5PCore::libraryToString($library, true) . '/',
+-            'itemid' => $library['libraryId']
++            'filepath' => '/' . H5PCore::libraryToFolderName($library) . '/',
++            'itemid' => $library['libraryId'],
+         ];
+ 
+         // Easiest approach: delete the existing library version and copy the new one.
+@@ -95,6 +97,18 @@ class file_storage implements H5PFileStorage {
+         $this->copy_directory($library['uploadDirectory'], $options);
+     }
+ 
++    /**
++     * Delete library folder.
++     *
++     * @param array $library
++     */
++    public function deleteLibrary($library) {
++        // Although this class had a method (delete_library()) for removing libraries before this was added to the interface,
++        // it's not safe to call it from here because looking at the place where it's called, it's not clear what are their
++        // expectation. This method will be implemented once more information will be added to the H5P technical doc.
++    }
++
++
+     /**
+      * Store the content folder.
+      *
+@@ -162,7 +176,7 @@ class file_storage implements H5PFileStorage {
+      * @param string $target Where the library folder will be saved
+      */
+     public function exportLibrary($library, $target) {
+-        $folder = H5PCore::libraryToString($library, true);
++        $folder = H5PCore::libraryToFolderName($library);
+         $this->export_file_tree($target . '/' . $folder, $this->context->id, self::LIBRARY_FILEAREA,
+                 '/' . $folder . '/', $library['libraryId']);
+     }
+@@ -432,7 +446,7 @@ class file_storage implements H5PFileStorage {
+ 
+         // Move all temporary content files to editor.
+         $it = new \RecursiveIteratorIterator(
+-            new \RecursiveDirectoryIterator($contentsource,\RecursiveDirectoryIterator::SKIP_DOTS),
++            new \RecursiveDirectoryIterator($contentsource, \RecursiveDirectoryIterator::SKIP_DOTS),
+             \RecursiveIteratorIterator::SELF_FIRST
+         );
+ 
+@@ -583,7 +597,7 @@ class file_storage implements H5PFileStorage {
+         global $DB;
+ 
+         // A library ID of false would result in all library files being deleted, which we don't want. Return instead.
+-        if ($library['libraryId'] === false) {
++        if (empty($library['libraryId'])) {
+             return;
+         }
+ 
+diff --git a/h5p/classes/framework.php b/h5p/classes/framework.php
+index 43be6787ff3..b3b2961fd3a 100644
+--- a/h5p/classes/framework.php
++++ b/h5p/classes/framework.php
+@@ -447,6 +447,9 @@ class framework implements H5PFrameworkInterface {
+             'Keywords already exists!' => 'keywordsExits',
+             'Some of these keywords already exist' => 'someKeywordsExits',
+             'Assistive Technologies label' => 'a11yTitle:label',
++            'width' => 'width',
++            'height' => 'height',
++            'Missing main library @library' => 'missingmainlibrary',
+         ];
+ 
+         if (isset($translationsmap[$message])) {
+diff --git a/h5p/h5plib/v124/joubel/core/h5p-default-storage.class.php b/h5p/h5plib/v124/joubel/core/h5p-default-storage.class.php
+index b4ac82e55ea..7f9c59ee591 100644
+--- a/h5p/h5plib/v124/joubel/core/h5p-default-storage.class.php
++++ b/h5p/h5plib/v124/joubel/core/h5p-default-storage.class.php
+@@ -41,7 +41,7 @@ class H5PDefaultStorage implements H5PFileStorage {
+    *  Library properties
+    */
+   public function saveLibrary($library) {
+-    $dest = $this->path . '/libraries/' . H5PCore::libraryToString($library, TRUE);
++    $dest = $this->path . '/libraries/' . H5PCore::libraryToFolderName($library);
+ 
+     // Make sure destination dir doesn't exist
+     H5PCore::deleteFileTree($dest);
+@@ -135,7 +135,7 @@ class H5PDefaultStorage implements H5PFileStorage {
+    *  Folder that library resides in
+    */
+   public function exportLibrary($library, $target, $developmentPath=NULL) {
+-    $folder = H5PCore::libraryToString($library, TRUE);
++    $folder = H5PCore::libraryToFolderName($library);
+     $srcPath = ($developmentPath === NULL ? "/libraries/{$folder}" : $developmentPath);
+     self::copyFileTree("{$this->path}{$srcPath}", "{$target}/{$folder}");
+   }
+diff --git a/h5p/h5plib/v124/joubel/core/h5p-file-storage.interface.php b/h5p/h5plib/v124/joubel/core/h5p-file-storage.interface.php
+index 5aba1219e69..efea48da966 100644
+--- a/h5p/h5plib/v124/joubel/core/h5p-file-storage.interface.php
++++ b/h5p/h5plib/v124/joubel/core/h5p-file-storage.interface.php
+@@ -19,6 +19,13 @@ interface H5PFileStorage {
+    */
+   public function saveLibrary($library);
+ 
++  /**
++   * Delete library folder
++   *
++   * @param array $library
++   */
++  public function deleteLibrary($library);
++
+   /**
+    * Store the content folder.
+    *
+diff --git a/h5p/h5plib/v124/joubel/core/h5p.classes.php b/h5p/h5plib/v124/joubel/core/h5p.classes.php
+index f3b8a4d31e6..da64805e3d8 100644
+--- a/h5p/h5plib/v124/joubel/core/h5p.classes.php
++++ b/h5p/h5plib/v124/joubel/core/h5p.classes.php
+@@ -800,6 +800,10 @@ class H5PValidator {
+    * TRUE if the .h5p file is valid
+    */
+   public function isValidPackage($skipContent = FALSE, $upgradeOnly = FALSE) {
++    // Create a temporary dir to extract package in.
++    $tmpDir = $this->h5pF->getUploadedH5pFolderPath();
++    $tmpPath = $this->h5pF->getUploadedH5pPath();
++
+     // Check dependencies, make sure Zip is present
+     if (!class_exists('ZipArchive')) {
+       $this->h5pF->setErrorMessage($this->h5pF->t('Your PHP version does not support ZipArchive.'), 'zip-archive-unsupported');
+@@ -812,10 +816,6 @@ class H5PValidator {
+       return FALSE;
+     }
+ 
+-    // Create a temporary dir to extract package in.
+-    $tmpDir = $this->h5pF->getUploadedH5pFolderPath();
+-    $tmpPath = $this->h5pF->getUploadedH5pPath();
+-
+     // Only allow files with the .h5p extension:
+     if (strtolower(substr($tmpPath, -3)) !== 'h5p') {
+       $this->h5pF->setErrorMessage($this->h5pF->t('The file you uploaded is not a valid HTML5 Package (It does not have the .h5p file extension)'), 'missing-h5p-extension');
+@@ -998,7 +998,7 @@ class H5PValidator {
+         //     - or -
+         // - <machineName>-<majorVersion>.<minorVersion>
+         // where machineName, majorVersion and minorVersion is read from library.json
+-        if ($libraryH5PData['machineName'] !== $file && H5PCore::libraryToString($libraryH5PData, TRUE) !== $file) {
++        if ($libraryH5PData['machineName'] !== $file && H5PCore::libraryToFolderName($libraryH5PData) !== $file) {
+           $this->h5pF->setErrorMessage($this->h5pF->t('Library directory name must match machineName or machineName-majorVersion.minorVersion (from library.json). (Directory: %directoryName , machineName: %machineName, majorVersion: %majorVersion, minorVersion: %minorVersion)', array(
+               '%directoryName' => $file,
+               '%machineName' => $libraryH5PData['machineName'],
+@@ -1068,7 +1068,12 @@ class H5PValidator {
+               'minorVersion' => $mainDependency['minorVersion']
+             ))) {
+           foreach ($missingLibraries as $libString => $library) {
+-            $this->h5pF->setErrorMessage($this->h5pF->t('Missing required library @library', array('@library' => $libString)), 'missing-required-library');
++            if (!empty($mainDependency) && $library['machineName'] === $mainDependency['machineName']) {
++              $this->h5pF->setErrorMessage($this->h5pF->t('Missing main library @library', array('@library' => $libString )), 'missing-main-library');
++            }
++            else {
++              $this->h5pF->setErrorMessage($this->h5pF->t('Missing required library @library', array('@library' => $libString)), 'missing-required-library');
++            }
+             $valid = FALSE;
+           }
+           if (!$this->h5pC->mayUpdateLibraries()) {
+@@ -1620,20 +1625,21 @@ class H5PStorage {
+ 
+     // Go through libraries that came with this package
+     foreach ($this->h5pC->librariesJsonData as $libString => &$library) {
+-      // Find local library identifier
+-      $libraryId = $this->h5pC->getLibraryId($library, $libString);
++      // Find local library with same major + minor
++      $existingLibrary = $this->h5pC->loadLibrary($library['machineName'], $library['majorVersion'], $library['minorVersion']);
+ 
+       // Assume new library
+       $new = TRUE;
+-      if ($libraryId) {
+-        // Found old library
+-        $library['libraryId'] = $libraryId;
++      if (isset($existingLibrary['libraryId'])) {
++        $new = false;
++        // We have the library installed already (with the same major + minor)
+ 
+-        if ($this->h5pF->isPatchedLibrary($library)) {
+-          // This is a newer version than ours. Upgrade!
+-          $new = FALSE;
+-        }
+-        else {
++        $library['libraryId'] = $existingLibrary['libraryId'];
++
++        // Is this a newer patchVersion?
++        $newerPatchVersion = $existingLibrary['patchVersion'] < $library['patchVersion'];
++
++        if (!$newerPatchVersion) {
+           $library['saveDependencies'] = FALSE;
+           // This is an older version, no need to save.
+           continue;
+@@ -1662,6 +1668,10 @@ class H5PStorage {
+       // Remove tmp folder
+       H5PCore::deleteFileTree($library['uploadDirectory']);
+ 
++      if ($existingLibrary) {
++        $this->h5pC->fs->deleteLibrary($existingLibrary);
++      }
++
+       if ($new) {
+         $newOnes++;
+       }
+@@ -1851,7 +1861,7 @@ Class H5PExport {
+ 
+     foreach(array('authors', 'source', 'license', 'licenseVersion', 'licenseExtras' ,'yearFrom', 'yearTo', 'changes', 'authorComments', 'defaultLanguage') as $field) {
+       if (isset($content['metadata'][$field]) && $content['metadata'][$field] !== '') {
+-        if (($field !== 'authors' && $field !== 'changes') || (count($content['metadata'][$field]) > 0)) {
++        if (($field !== 'authors' && $field !== 'changes') || (!empty($content['metadata'][$field]))) {
+           $h5pJson[$field] = json_decode(json_encode($content['metadata'][$field], TRUE));
+         }
+       }
+@@ -2119,6 +2129,21 @@ class H5PCore {
+     self::DISABLE_COPYRIGHT => self::DISPLAY_OPTION_COPYRIGHT
+   );
+ 
++  /** @var string */
++  public $url;
++
++  /** @var int evelopment mode. */
++  public $development_mode;
++
++  /** @var bool aggregated files for assets. */
++  public $aggregateAssets;
++
++  /** @var string full path of plugin. */
++  protected $fullPluginPath;
++
++  /** @var string regex for converting copied files paths. */
++  public $relativePathRegExp;
++
+   /**
+    * Constructor for the H5PCore
+    *
+@@ -2526,7 +2551,7 @@ class H5PCore {
+    * @return string
+    */
+   protected function getDependencyPath(array $dependency) {
+-    return 'libraries/' . H5PCore::libraryToString($dependency, TRUE);
++    return 'libraries/' . H5PCore::libraryToFolderName($dependency);
+   }
+ 
+   private static function getDependenciesHash(&$dependencies) {
+@@ -2719,14 +2744,26 @@ class H5PCore {
+    * Writes library data as string on the form {machineName} {majorVersion}.{minorVersion}
+    *
+    * @param array $library
+-   *  With keys machineName, majorVersion and minorVersion
+-   * @param boolean $folderName
+-   *  Use hyphen instead of space in returned string.
++   *  With keys (machineName and/or name), majorVersion and minorVersion
+    * @return string
+    *  On the form {machineName} {majorVersion}.{minorVersion}
+    */
+-  public static function libraryToString($library, $folderName = FALSE) {
+-    return (isset($library['machineName']) ? $library['machineName'] : $library['name']) . ($folderName ? '-' : ' ') . $library['majorVersion'] . '.' . $library['minorVersion'];
++  public static function libraryToString($library) {
++    $name = $library['machineName'] ?? $library['name'];
++
++    return "{$name} {$library['majorVersion']}.{$library['minorVersion']}";
++  }
++
++  /**
++   * Get the name of a library's folder name
++   *
++   * @return string
++   */
++  public static function libraryToFolderName($library) {
++    $name = $library['machineName'] ?? $library['name'];
++    $includePatchVersion = $library['patchVersionInFolderName'] ?? false;
++
++    return "{$name}-{$library['majorVersion']}.{$library['minorVersion']}" . ($includePatchVersion ? ".{$library['patchVersion']}" : '');
+   }
+ 
+   /**
+diff --git a/h5p/h5plib/v124/joubel/core/js/h5p.js b/h5p/h5plib/v124/joubel/core/js/h5p.js
+index e71a0d6ed3b..7b36f995103 100644
+--- a/h5p/h5plib/v124/joubel/core/js/h5p.js
++++ b/h5p/h5plib/v124/joubel/core/js/h5p.js
+@@ -2342,6 +2342,12 @@ H5P.createTitle = function (rawTitle, maxLength) {
+       return;
+     }
+ 
++    // Moodle patch to let override this method.
++    if (H5P.contentUserDataAjax !== undefined) {
++      return H5P.contentUserDataAjax(contentId, dataType, subContentId, done, data, preload, invalidate, async);
++    }
++    // End of Moodle patch.
++
+     var options = {
+       url: H5PIntegration.ajax.contentUserData.replace(':contentId', contentId).replace(':dataType', dataType).replace(':subContentId', subContentId ? subContentId : 0),
+       dataType: 'json',
+diff --git a/h5p/h5plib/v124/joubel/core/readme_moodle.txt b/h5p/h5plib/v124/joubel/core/readme_moodle.txt
+index 7d023a51c85..d9a2c3ac2ce 100644
+--- a/h5p/h5plib/v124/joubel/core/readme_moodle.txt
++++ b/h5p/h5plib/v124/joubel/core/readme_moodle.txt
+@@ -29,3 +29,9 @@ Changed:
+ 
+ 3. Check if there are changes in the getLocalization() method in h5p.classes.php and update lang/en/h5p.php accordingly.
+    If there are changes, check the t() method in h5p/classes/framework.php too (updating or adding new ones).
++
++4. In saveLibraries() method in core/h5p.classes.php, check $this->h5pF->saveLibraryData is called before $this->h5pC->fs->saveLibrary.
++The library needs to be saved in the database first before creating the files, because the libraryid is used as itemid for the files.
++
++5. Check if new methods have been added to any of the interfaces. If that's the case, implement them in the proper class. For
++instance, if a new method is added to h5p-file-storage.interface.php, it should be implemented in h5p/classes/file_storage.php.
+diff --git a/h5p/h5plib/v124/joubel/editor/h5peditor.class.php b/h5p/h5plib/v124/joubel/editor/h5peditor.class.php
+index 2edb3b4a9a3..a49b53fd359 100644
+--- a/h5p/h5plib/v124/joubel/editor/h5peditor.class.php
++++ b/h5p/h5plib/v124/joubel/editor/h5peditor.class.php
+@@ -407,7 +407,7 @@ class H5peditor {
+ 
+     // Get list of JS and CSS files that belongs to the dependencies
+     $files = $this->h5p->getDependenciesFiles($libraries, $prefix);
+-    $libraryName = H5PCore::libraryToString(compact('machineName', 'majorVersion', 'minorVersion'), true);
++    $libraryName = H5PCore::libraryToFolderName($library);
+     if ($this->hasPresave($libraryName) === true) {
+       $this->addPresaveFile($files, $library, $prefix);
+     }
+@@ -751,7 +751,7 @@ class H5peditor {
+    * @param string $prefix
+    */
+   public function addPresaveFile(&$assets, $library, $prefix = ''){
+-    $path = 'libraries' . '/' . H5PCore::libraryToString($library, true);
++    $path = 'libraries' . '/' . H5PCore::libraryToString($library);
+     if( array_key_exists('path', $library)){
+       $path = $library['path'];
+     }
+diff --git a/h5p/h5plib/v124/thirdpartylibs.xml b/h5p/h5plib/v124/thirdpartylibs.xml
+index 4a4e5c7e91e..14e1e5644b1 100644
+--- a/h5p/h5plib/v124/thirdpartylibs.xml
++++ b/h5p/h5plib/v124/thirdpartylibs.xml
+@@ -4,7 +4,7 @@
+     <location>joubel/core</location>
+     <name>h5p-php-library</name>
+     <description>The general H5P library.</description>
+-    <version>moodle-1.22.4</version>
++    <version>moodle-1.23</version>
+     <license>GPL</license>
+     <licenseversion>3.0+</licenseversion>
+     <repository>https://github.com/h5p/h5p-php-library/</repository>
+diff --git a/h5p/tests/helper_test.php b/h5p/tests/helper_test.php
+index 5857f3bab14..20108903b8a 100644
+--- a/h5p/tests/helper_test.php
++++ b/h5p/tests/helper_test.php
+@@ -154,8 +154,8 @@ class helper_test extends \advanced_testcase {
+         $errors = $factory->get_framework()->getMessages('error');
+         $this->assertCount(1, $errors);
+         $error = reset($errors);
+-        $this->assertEquals('missing-required-library', $error->code);
+-        $this->assertEquals('Missing required library H5P.GreetingCard 1.0', $error->message);
++        $this->assertEquals('missing-main-library', $error->code);
++        $this->assertEquals('Missing main library H5P.GreetingCard 1.0', $error->message);
+     }
+ 
+     /**
+diff --git a/lang/en/cache.php b/lang/en/cache.php
+index 668d890ae7d..30ecda933a7 100644
+--- a/lang/en/cache.php
++++ b/lang/en/cache.php
+@@ -65,6 +65,7 @@ $string['cachedef_file_imageinfo'] = 'File image info e.g. dimensions';
+ $string['cachedef_suspended_userids'] = 'List of suspended users per course';
+ $string['cachedef_groupdata'] = 'Course group information';
+ $string['cachedef_h5p_content_type_translations'] = 'H5P content-type libraries translations';
++$string['cachedef_h5p_libraries'] = 'H5P libraries';
+ $string['cachedef_h5p_library_files'] = 'H5P library files';
+ $string['cachedef_htmlpurifier'] = 'HTML Purifier - cleaned content';
+ $string['cachedef_langmenu'] = 'List of available languages';
+diff --git a/lang/en/h5p.php b/lang/en/h5p.php
+index f36928bbe73..872aa07a2f4 100644
+--- a/lang/en/h5p.php
++++ b/lang/en/h5p.php
+@@ -137,6 +137,7 @@ $string['h5poverview'] = 'H5P overview';
+ $string['h5ppackage'] = 'H5P content type';
+ $string['h5ppackage_help'] = 'An H5P content type is a file with an H5P or ZIP extension containing all libraries required to display the content.';
+ $string['h5psettings'] = 'H5P settings';
++$string['height'] = 'height';
+ $string['helpChoosingLicense'] = 'Help me choose a license';
+ $string['hideadvanced'] = 'Hide advanced';
+ $string['icon'] = 'Icon';
+@@ -202,6 +203,7 @@ $string['missingcontentfolder'] = 'A valid content folder is missing';
+ $string['missingcoreversion'] = 'The system was unable to install the {$a->%component} component from the package, as it requires a newer version of the H5P plugin. This site is currently running version {$a->%current}, whereas the required version is {$a->%required} or higher. Please upgrade and then try again.';
+ $string['missingdependency'] = 'Missing dependency {$a->@dep} required by {$a->@lib}.';
+ $string['missinglibrary'] = 'Missing required library {$a->@library}';
++$string['missingmainlibrary'] = 'Missing main library {$a->@library}';
+ $string['missinglibraryfile'] = 'The file "{$a->%file}" is missing from library: "{$a->%name}"';
+ $string['missinglibraryjson'] = 'Could not find library.json file with valid json format for library {$a->%name}';
+ $string['missinglibraryproperty'] = 'The required property {$a->%property} is missing from {$a->%library}';
+@@ -286,6 +288,7 @@ $string['updatedlibrary'] = 'Updated {$a->%old} H5P library.';
+ $string['uploadlibraries'] = 'Upload H5P content types';
+ $string['updateRegistrationOnHub'] = 'Save account settings';
+ $string['uploadsuccess'] = 'H5P content types uploaded successfully';
++$string['width'] = 'width';
+ $string['wrongversion'] = 'The version of the H5P library {$a->%machineName} used in this content is not valid. Content contains {$a->%contentLibrary}, but it should be {$a->%semanticsLibrary}.';
+ $string['year'] = 'Year';
+ $string['years'] = 'Year(s)';
+diff --git a/lib/db/caches.php b/lib/db/caches.php
+index 65ca654090c..39b963c50f6 100644
+--- a/lib/db/caches.php
++++ b/lib/db/caches.php
+@@ -477,6 +477,13 @@ $definitions = array(
+         'simpledata' => true,
+     ],
+ 
++    // File cache for H5P Library ids.
++    'h5p_libraries' => [
++        'mode' => cache_store::MODE_APPLICATION,
++        'simplekeys' => true,
++        'canuselocalstore' => true
++    ],
++
+     // File cache for H5P Library files.
+     'h5p_library_files' => [
+         'mode' => cache_store::MODE_APPLICATION,
+diff --git a/lib/editor/atto/plugins/h5p/tests/behat/h5p.feature b/lib/editor/atto/plugins/h5p/tests/behat/h5p.feature
+index 5dbead20b41..fc884b4f3d9 100644
+--- a/lib/editor/atto/plugins/h5p/tests/behat/h5p.feature
++++ b/lib/editor/atto/plugins/h5p/tests/behat/h5p.feature
+@@ -125,7 +125,7 @@ Feature: Use the Atto editor to upload an h5p package
+     And I should not see "Cloudberries"
+ 
+   @javascript
+-  Scenario: Enable/disable H5P options
++  Scenario: Enable/disable H5P options atto
+     Given the following "user private file" exists:
+       | user     | admin                                   |
+       | filepath | h5p/tests/fixtures/guess-the-answer.h5p |
+@@ -137,14 +137,11 @@ Feature: Use the Atto editor to upload an h5p package
+     And I click on "Select this file" "button"
+ #   No display option button displayed
+     And I click on "Insert H5P" "button" in the "Insert H5P" "dialogue"
+-    And I wait until the page is ready
+     When I click on "Save and display" "button"
+     And I wait until the page is ready
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    Then I should not see "Reuse"
+-    And I should not see "Embed"
+-    And I should not see "Rights of use"
++    Then ".h5p-actions" "css_element" should not exist
+     And I switch to the main frame
+     And I navigate to "Settings" in current page administration
+     And I click on ".h5p-placeholder" "css_element"
+@@ -153,12 +150,10 @@ Feature: Use the Atto editor to upload an h5p package
+ #   Only Allow Download button displayed
+     And I click on "Allow download" "checkbox"
+     And I click on "Insert H5P" "button" in the "Insert H5P" "dialogue"
+-    And I wait until the page is ready
+     And I click on "Save and display" "button"
+-    And I wait until the page is ready
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    And I should see "Reuse"
++    And "Reuse" "text" should exist in the ".h5p-actions" "css_element"
+     And I should not see "Embed"
+     And I should not see "Rights of use"
+     And I switch to the main frame
+@@ -170,12 +165,10 @@ Feature: Use the Atto editor to upload an h5p package
+     And I click on "Embed button" "checkbox"
+     And I click on "Copyright button" "checkbox"
+     And I click on "Insert H5P" "button" in the "Insert H5P" "dialogue"
+-    And I wait until the page is ready
+     And I click on "Save and display" "button"
+-    And I wait until the page is ready
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    And I should not see "Reuse"
++    And "Reuse" "text" should not exist in the ".h5p-actions" "css_element"
+     And I should see "Embed"
+     And I should see "Rights of use"
+ 
+diff --git a/lib/editor/tiny/plugins/h5p/tests/behat/h5p.feature b/lib/editor/tiny/plugins/h5p/tests/behat/h5p.feature
+index 3eb089ab059..0c6d6634718 100644
+--- a/lib/editor/tiny/plugins/h5p/tests/behat/h5p.feature
++++ b/lib/editor/tiny/plugins/h5p/tests/behat/h5p.feature
+@@ -98,7 +98,7 @@ Feature: Use the TinyMCE editor to upload an h5p package
+     And I should not see "Cloudberries"
+ 
+   @javascript
+-  Scenario: Enable/disable H5P options
++  Scenario: Enable/disable H5P options tiny
+     Given the following "user private file" exists:
+       | user     | admin                                   |
+       | filepath | h5p/tests/fixtures/guess-the-answer.h5p |
+@@ -112,9 +112,7 @@ Feature: Use the TinyMCE editor to upload an h5p package
+     When I click on "Save and display" "button"
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    Then I should not see "Reuse"
+-    And I should not see "Embed"
+-    And I should not see "Rights of use"
++    Then ".h5p-actions" "css_element" should not exist
+     And I switch to the main frame
+     And I navigate to "Settings" in current page administration
+     And I select the ".h5p-placeholder" "css_element" in the "Page content" TinyMCE editor
+@@ -126,7 +124,7 @@ Feature: Use the TinyMCE editor to upload an h5p package
+     And I click on "Save and display" "button"
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    And I should see "Reuse"
++    And "Reuse" "text" should exist in the ".h5p-actions" "css_element"
+     And I should not see "Embed"
+     And I should not see "Rights of use"
+     And I switch to the main frame
+@@ -141,7 +139,7 @@ Feature: Use the TinyMCE editor to upload an h5p package
+     And I click on "Save and display" "button"
+     And I switch to "h5pcontent" iframe
+     And I switch to "h5p-iframe" class iframe
+-    And I should not see "Reuse"
++    And "Reuse" "text" should not exist in the ".h5p-actions" "css_element"
+     And I should see "Embed"
+     And I should see "Rights of use"
+ 
+diff --git a/repository/contentbank/tests/behat/file_update.feature b/repository/contentbank/tests/behat/file_update.feature
+index 89692c34483..87d2d795e43 100644
+--- a/repository/contentbank/tests/behat/file_update.feature
++++ b/repository/contentbank/tests/behat/file_update.feature
+@@ -38,7 +38,7 @@ Feature: Updating a file in the content bank after using in a course
+     And I expand "Site pages" node
+     And I click on "Content bank" "link"
+     And I click on "package.h5p" "link"
+-    And I click on "Edit" "link"
++    And I click on "Edit" "link" in the ".core_contentbank_viewcontent" "css_element"
+     And I wait until the page is ready
+     And I switch to "h5p-editor-iframe" class iframe
+     And I set the field "Title" to "Required title"
+@@ -81,7 +81,7 @@ Feature: Updating a file in the content bank after using in a course
+     And I expand "Site pages" node
+     And I click on "Content bank" "link"
+     And I click on "package.h5p" "link"
+-    And I click on "Edit" "link"
++    And I click on "Edit" "link" in the ".core_contentbank_viewcontent" "css_element"
+     And I wait until the page is ready
+     And I switch to "h5p-editor-iframe" class iframe
+     And I set the field "Title" to "Required title"
